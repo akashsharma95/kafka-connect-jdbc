@@ -465,5 +465,8 @@ public class JdbcDbWriterTest {
 
     List<String> splitDdlStatements3 = writer.getSplitDdlStatements("ALTER TABLE old_table RENAME new_table;");
     assertArrayEquals(new String[]{}, splitDdlStatements3.toArray());
+
+    List<String> splitDdlStatements4 = writer.getSplitDdlStatements("CREATE TABLE Persons\n (PersonID int, LastName varchar(255), FirstName varchar(255), Address varchar(255), City varchar(255));");
+    assertArrayEquals(new String[]{"CREATE TABLE IF NOT EXISTS Persons (PersonID int, LastName varchar(255), FirstName varchar(255), Address varchar(255), City varchar(255));"}, splitDdlStatements4.toArray());
   }
 }
