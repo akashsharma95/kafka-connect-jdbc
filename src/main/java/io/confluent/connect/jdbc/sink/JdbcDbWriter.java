@@ -15,23 +15,43 @@
 
 package io.confluent.connect.jdbc.sink;
 
-import org.apache.kafka.connect.errors.ConnectException;
-import org.apache.kafka.connect.sink.SinkRecord;
-
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.Collection;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Arrays;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.SinkRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import io.confluent.connect.jdbc.dialect.DatabaseDialect;
 import io.confluent.connect.jdbc.util.CachedConnectionProvider;
 import io.confluent.connect.jdbc.util.TableId;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 public class JdbcDbWriter {
   private static final Logger log = LoggerFactory.getLogger(JdbcDbWriter.class);
+
+  private static final List<String> ignoreQuery = Arrays.asList("rename table");
+
+  private static final List<String> ddlKeywords = Arrays.asList("add ", "modify ", "change ", "rename ", "drop ");
+
+  private static final List<String> blacklistedQueries = Arrays.asList("add index", "add unique key",
+      "add unique index", "add unique");
+
+  private static final List<String> whitelistedQueries = Arrays.asList("add column", "drop column", "modify column",
+      "add ", "change column", "change ", "rename column");
+
+  private static Pattern alterTablePattern = Pattern.compile("ALTER TABLE (\\S+)", Pattern.CASE_INSENSITIVE);
 
   private final JdbcSinkConfig config;
   private final DatabaseDialect dbDialect;
@@ -43,10 +63,7 @@ public class JdbcDbWriter {
     this.dbDialect = dbDialect;
     this.dbStructure = dbStructure;
 
-    this.cachedConnectionProvider = connectionProvider(
-        config.connectionAttempts,
-        config.connectionBackoffMs
-    );
+    this.cachedConnectionProvider = connectionProvider(config.connectionAttempts, config.connectionBackoffMs);
   }
 
   protected CachedConnectionProvider connectionProvider(int maxConnAttempts, long retryBackoff) {
@@ -65,6 +82,13 @@ public class JdbcDbWriter {
 
     final Map<TableId, BufferedRecords> bufferByTable = new HashMap<>();
     for (SinkRecord record : records) {
+
+      // apply ddl statements
+      if (applyDdlStatementsIfApplicable(record, connection)) {
+        // skip this sink record from buffer
+        continue;
+      }
+
       final TableId tableId = destinationTable(record.topic());
       BufferedRecords buffer = bufferByTable.get(tableId);
       if (buffer == null) {
@@ -90,12 +114,115 @@ public class JdbcDbWriter {
   TableId destinationTable(String topic) {
     final String tableName = config.tableNameFormat.replace("${topic}", topic);
     if (tableName.isEmpty()) {
-      throw new ConnectException(String.format(
-          "Destination table name for topic '%s' is empty using the format string '%s'",
-          topic,
-          config.tableNameFormat
-      ));
+      throw new ConnectException(
+          String.format("Destination table name for topic '%s' is empty using the format string '%s'", topic,
+              config.tableNameFormat));
     }
     return dbDialect.parseTableIdentifier(tableName);
+  }
+
+  boolean applyDdlStatementsIfApplicable(SinkRecord record, Connection connection) throws SQLException {
+    if (record.valueSchema() == null) {
+      return false;
+    }
+
+    String valueSchemaName = record.valueSchema().name();
+
+    if ((valueSchemaName != null)
+        && (valueSchemaName.equalsIgnoreCase("io.debezium.connector.mysql.SchemaChangeValue"))) {
+      Struct valueStruct = (Struct) record.value();
+      String ddl = valueStruct.get("ddl").toString().trim();
+
+      log.info("DDL Statement: {}", ddl);
+
+      if (ddl.toLowerCase().startsWith("create") || ddl.toLowerCase().startsWith("alter")) {
+        try {
+          Statement stmt = connection.createStatement();
+          for (String s : getSplitDdlStatements(ddl)) {
+            log.info("Applying DDL statement: {}", s);
+            stmt.execute(s);
+          }
+          stmt.close();
+        } catch (java.sql.SQLException e) {
+          // handle few error_code and error_state with retry
+          log.info("SQL ErrorCode: {}, SQL ErrorState: {}", e.getErrorCode(), e.getSQLState());
+          log.error("Failed to apply DDL statement {}: {}", ddl, e);
+          throw e;
+        }
+      }
+
+      // return true since we also need to skip other ddl statements present in this
+      // topic
+      return true;
+    }
+
+    return false;
+  }
+
+  List<String> getSplitDdlStatements(String ddlStatement) {
+    List<String> ddlStatements = new ArrayList<String>();
+
+    if (ignoreQuery.stream().anyMatch(ddlStatement.toLowerCase()::contains)) {
+      return ddlStatements;
+    }
+
+    List<String> splitQueries = splitDdlStatement(ddlStatement);
+    if (ddlStatement.toLowerCase().startsWith("alter")) {
+      String suffix = "ALTER TABLE " + getTableNameFromDdlStatement(ddlStatement);
+
+      // remove all blacklisted queries
+      List<String> filteredQueries = splitQueries.stream()
+          .filter((q) -> !blacklistedQueries.stream().anyMatch(q.toLowerCase()::contains)
+              && whitelistedQueries.stream().anyMatch(q.toLowerCase()::contains))
+          .collect(Collectors.toList());
+
+      if (filteredQueries.size() > 0) {
+        ddlStatements.add(filteredQueries.get(0));
+        ddlStatements.addAll(filteredQueries.stream().skip(1).map((q) -> String.format("%s %s", suffix, q))
+            .collect(Collectors.toList()));
+      }
+    } else if (ddlStatement.toLowerCase().startsWith("create table")) {
+      ddlStatement = ddlStatement.replace("\n", "").replace("\r", "");
+      String updatedDdlStatement = ddlStatement.replaceFirst("(?i)create table( if not exists)*",
+          "CREATE TABLE IF NOT EXISTS");
+      ddlStatements.add(updatedDdlStatement);
+    }
+
+    return ddlStatements;
+  }
+
+  List<String> splitDdlStatement(String ddlStatement) {
+    List<String> queries = new ArrayList<String>();
+
+    String[] splitQueries = ddlStatement.split(",");
+
+    if (splitQueries.length > 0) {
+      int idx = 0;
+      while (idx < splitQueries.length) {
+        int updatedPos = idx + 1;
+        String query = splitQueries[idx];
+
+        while (updatedPos < splitQueries.length
+            && !ddlKeywords.stream().anyMatch(splitQueries[updatedPos].toLowerCase()::contains)) {
+          query = String.join(",", Arrays.asList(query, splitQueries[updatedPos]));
+          updatedPos++;
+        }
+        idx = updatedPos;
+        queries.add(query);
+      }
+    }
+
+    return queries;
+  }
+
+  String getTableNameFromDdlStatement(String ddlStatement) {
+    String tableName = "";
+
+    Matcher matcher = alterTablePattern.matcher(ddlStatement);
+    if (matcher.find()) {
+      tableName = matcher.group(1);
+    }
+
+    return tableName;
   }
 }
